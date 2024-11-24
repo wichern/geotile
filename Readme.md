@@ -9,4 +9,4 @@
 
 
 
-10cm sollen 1,76 km entsprechen
+You can check the geojson at https://geojson.io
