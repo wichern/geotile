@@ -1,233 +1,191 @@
 #!/usr/bin/env python3
 
-__copyright__ = "Copyright 2024, Paul Wichern"
-
-import osmnx as ox
-import math
-import json
-import elevation
+import osmnx        # OpenStreetMap API
+import pyproj       # Projection Library (EPSG:4326 <-> EPSG:32632)
+import shapely      # Geometry Library
+import pandas       # Pandas
+import geopandas    # Pandas for Geodata
+import tempfile     # Temporary files
+import elevation    # Elevation data API
+import pathlib
 import subprocess
-from pathlib import Path
-import shapely.geometry
-import numpy as np
 
-LATITUDE = 0
-LONGITUDE = 1
+def calcuate_elevation(lbrt_bounds : tuple, elevation_step : int):
+    # Create tempfiles
+    tmp_geojson = pathlib.Path(tempfile.NamedTemporaryFile(suffix='.geojson').name)
+    tmp_tif = pathlib.Path(tempfile.NamedTemporaryFile(suffix='.tif').name)
 
-TILE_SIZE_METERS = 1000
-ELEVATION_LINE_METERS = 15
+    # Fetch data
+    elevation.clip(bounds=lbrt_bounds, output=tmp_tif)
 
-def simplify(polygon, tolerance = 0.00001):
-    """ Simplify a polygon with shapely.
-    Polygon: ndarray
-        ndarray of the polygon positions of N points with the shape (N,2)
-    tolerance: float
-        the tolerance
-    """
-    for i in range(0, len(polygon)):
-        for j in range(0, len(polygon[i])):
-            print(polygon[i][j])
-            poly = shapely.geometry.Polygon(polygon[i][j])
-            poly_s = poly.simplify(tolerance=tolerance)
-            # convert it back to numpy
-            polygon[i][j] = poly_s.boundary.coords[:]
-    return polygon
-
-def nonmax(a, b):
-    if a == None:
-        return b
-    if b == None:
-        return a
-    return max(a, b)
-
-def nonmin(a, b):
-    if a == None:
-        return b
-    if b == None:
-        return a
-    return min(a, b)
-
-class GeoJSON:
-    def __init__(self):
-        self.json = { 'type': 'FeatureCollection', 'features': [] }
-
-    def add_bbox(self, bbox):
-        feature = { 
-            'type': 'Feature',
-            'geometry': {
-                'type': 'LineString',
-                'coordinates': [
-                    [bbox[2], bbox[0]],
-                    [bbox[2], bbox[1]],
-                    [bbox[3], bbox[1]],
-                    [bbox[3], bbox[0]],
-                    [bbox[2], bbox[0]]
-                ]
-            },
-            'properties': {
-                'stroke': '#0000ff',
-                'stroke-width': 1
-            }
-        }
-        self.json['features'].append(feature)
-        self.json['metadata'] = {
-            'x_min': bbox[3],
-            'y_min': bbox[1],
-            'x_scale': 10 / (bbox[2] - bbox[3]),
-            'y_scale': 10 / (bbox[0] - bbox[1])
-        }
-
-    def add_feature(self, feature):
-        self.json['features'].append(feature)
-
-    def save(self, path):
-        with open(path, 'w') as outfile:
-            outfile.write(json.dumps(self.json, indent=2))
-
-def create_bbox(center, size):
-    # In the Mercator projection, we have to use a smaller latitude in order to get a square.
-    long_multiplier = math.cos(math.radians(center[LATITUDE]))
-    print(f'longitude multiplier: {long_multiplier}')
-
-    return [
-        center[LATITUDE] + size/2*long_multiplier, # north / ymax
-        center[LATITUDE] - size/2*long_multiplier, # south / ymin
-        center[LONGITUDE] + size/2, # east / xmax
-        center[LONGITUDE] - size/2  # west / xmin
-    ]
-
-def fetch_streets(bbox, geojson):
-    G = ox.graph_from_bbox(None, None, None, None,
-            bbox, 'drive', simplify=False, truncate_by_edge=True, retain_all=True)
-    
-    # Convert to GeoDataFrame
-    edges = ox.graph_to_gdfs(G, nodes=False)  # Get edges
-
-    for edge in edges.itertuples():
-        lanes = getattr(edge, 'lanes', '1')
-        if math.isnan(float(lanes)):
-            lanes = '1'
-
-        feature = { 
-            'type': 'Feature',
-            'geometry': {
-                'type': 'LineString',
-                'coordinates': list(edge.geometry.coords)
-            },
-            'properties': {
-                'lanes': lanes
-            }
-        }
-        geojson.add_feature(feature)
-
-def fetch_landuse(bbox, geojson, type='residential'):
-    features = ox.features_from_bbox(None, None, None, None, bbox, {'landuse': type})
-    
-    for feature in features.itertuples():
-        json_feature = { 
-            'type': 'Feature',
-            'geometry': {
-                'type': 'LineString',
-                'coordinates': list(feature.geometry.exterior.coords)
-            },
-            'properties': {
-                'type': type,
-                'stroke': '#ff0000',
-                'stroke-width': 1
-            }
-        }
-        geojson.add_feature(json_feature)
-
-def transform_polygon(polygon, bbox, x_offset, y_offset, x_scale, y_scale):
-    return [ [ [ [coord[0] + x_offset + (coord[0] - bbox[3])*x_scale - (coord[0] - bbox[3]), coord[1] + y_offset + (coord[1] - bbox[1])*y_scale - (coord[1] - bbox[1])] for coord in ring ] for ring in p ] for p in polygon]
-
-def fetch_elevation(bbox, geojson, clean=False):
-    if clean:
-        elevation.clean()
-
-    # Fetch DEM from NASA servers
-    elevation.clip(bounds=(
-        bbox[3], bbox[1], bbox[2], bbox[0]
-    ), output=Path.cwd()/'region_dem.tif')
-
-    # Generate contours
+    # Calculate contours
     subprocess.run([
         'gdal_contour',
-        '-i', str(ELEVATION_LINE_METERS),               # 5m interval
-        '-amin', 'elevation_min',
-        '-amax', 'elevation_max',
+        '-i', str(elevation_step),               # 5m interval
+        '-amax', 'elevation',
         '-p', # Create polygons instead of polylines
-        '-q', # Quit
-        Path.cwd()/'region_dem.tif',
-        Path.cwd()/'contours.geojson'
+        '-q', # quiet
+        tmp_tif,
+        tmp_geojson
     ])
-    
-    with open(Path.cwd()/'contours.geojson', 'r') as json_in:
-        data = json.load(json_in)
 
-        # The coordinates do not perfectly match. We transform them so that they do.
-        # 1. Get min and max
-        min_x = None
-        min_y = None
-        max_x = None
-        max_y = None
-        for feature in data['features']:
-            for polygons in feature['geometry']['coordinates']:
-                for polygon in polygons:
-                    for coord in polygon:
-                        min_y = nonmin(coord[LONGITUDE], min_y)
-                        max_y = nonmax(coord[LONGITUDE], max_y)
-                        min_x = nonmin(coord[LATITUDE], min_x)
-                        max_x = nonmax(coord[LATITUDE], max_x)
+    return geopandas.read_file(tmp_geojson)[['geometry', 'elevation']]
 
-        height_bbox = bbox[0] - bbox[1]
-        width_bbox = bbox[2] - bbox[3]
-        print(f'width_bbox = {width_bbox}, height_bbox = {height_bbox}')
+HEXAGON_SIZE = 650
 
-        width_elev = max_x - min_x
-        height_elev = max_y - min_y
-        print(f'width_elev = {width_elev}, height_elev = {height_elev}')
+TO_UTM = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:32632", always_xy=True)
+TO_LATLONG = pyproj.Transformer.from_crs("EPSG:32632", "EPSG:4326", always_xy=True)
 
-        width_scale = width_bbox / width_elev
-        heigth_scale = height_bbox / height_elev
+def main():
+    # GPS Coordinates (EPSG:4326)
+    point = osmnx.geocoder.geocode('Groß Escherde')
 
-        print(f'min_x = {min_x}, bbox[3] = {bbox[3]}')
-        print(f'min_y = {min_y}, bbox[1] = {bbox[1]}')
+    class Hexagon:
+        def __init__(self, center : shapely.Point, size : float):
+            self.center = center
+            self.size = size
+            self._streets_gdf = None
+            self._elevation_gdf = None
 
-        translate_x = -(min_x - bbox[3])
-        translate_y = -(min_y - bbox[1])
+        @property
+        def polygon(self):
+            x = self.center.x
+            y = self.center.y
 
-        print(f'width_scale = {width_scale}')
+            return shapely.Polygon(
+                [
+                    (x - self.size/2, y + self.size),
+                    (x - self.size, y),
+                    (x - self.size/2, y - self.size),
+                    (x + self.size/2, y - self.size),
+                    (x + self.size, y),
+                    (x + self.size/2, y + self.size),
+                    (x - self.size/2, y + self.size)
+                ]
+            )
 
-        for feature in data['features']:
-            feature['properties']['stroke'] = '#00ff00'
-            feature['properties']['stroke-width'] = '1'
-            feature['geometry']['coordinates'] = transform_polygon(feature['geometry']['coordinates'], bbox, translate_x, translate_y, width_scale, heigth_scale)
+        @property
+        def polygon_gdf(self):
+            geopandas.GeoDataFrame({'type': ['hexagon'], 'geometry': [shapely.ops.transform(TO_LATLONG.transform, hexagon.polygon)]}, crs='EPSG:4326')
 
-            simplify(feature['geometry']['coordinates'])
+        def get_neighbours(self, tile_distance : int):
+            ret = []
 
-            geojson.add_feature(feature)
+            pos = shapely.Point(
+                self.center.x - self.size * 3 / 2 * tile_distance,
+                self.center.y - self.size * tile_distance)
+
+            directions = [(1, -1), (1, 1), (0, 2), (-1, 1), (-1, -1), (0, -2)]
+            for i in range(0, 6):
+                for j in range(0, tile_distance):
+                    pos = shapely.Point(
+                        pos.x + self.size * 3 / 2 * directions[i][0],
+                        pos.y + self.size * directions[i][1])
+                    ret.append(Hexagon(pos, self.size))
+
+            return ret
+
+        def get_elevation_gdf(self, step : int, elevation_minmax : tuple):
+            if self._elevation_gdf is None:
+                # Get transformed lbrt bounds (a bit larger, because of transformation errors)
+                lbrt_bounds = shapely.ops.transform(
+                    TO_LATLONG.transform,
+                    self.center.buffer(self.size*1.1)).bounds
+
+                gdf = calcuate_elevation(lbrt_bounds, step)
+
+                # Clip all polygons inside gdf to this hexagon
+                hexagon_poly = shapely.ops.transform(TO_LATLONG.transform, self.polygon)
+                gdf['geometry'] = gdf.intersection(hexagon_poly)
+                gdf = gdf[~gdf.is_empty] 
+
+                gdf['type'] = 'elevation'
+
+                # Loop over all rows and get 'elevation_min' and 'elevation_max' columns
+                for i, row in gdf.iterrows():
+                    if not row['geometry'].is_empty:
+                        elevation_minmax[0] = min(elevation_minmax[0], row['elevation'])
+                        elevation_minmax[1] = max(elevation_minmax[1], row['elevation'])
+
+                self._elevation_gdf = gdf
+
+            return self._elevation_gdf, elevation_minmax
+
+        @property
+        def streets_gdf(self):
+            if self._streets_gdf is None:
+                ll_poly = shapely.ops.transform(TO_LATLONG.transform, self.polygon)
+                gdf = None
+                try:
+                    G = osmnx.graph_from_polygon(ll_poly, network_type='drive', simplify=False, truncate_by_edge=True, retain_all=True)
+                    gdf = osmnx.graph_to_gdfs(G, nodes=False)
+
+                    # Add lanes if it does not exist
+                    gdf['lanes'] = gdf.get('lanes', 0)
+
+                    # Drop all columns we are not interested in
+                    gdf = gdf[['geometry', 'lanes']]
+                    gdf['type'] = 'street'
+                    gdf['lanes'].fillna(0, inplace=True)
+                    gdf = gdf.convert_dtypes()
+
+                    self._streets_gdf = gdf
+                except ValueError as e:
+                    # No streets in this hexagon
+                    self._streets_gdf = geopandas.GeoDataFrame()
+                except Exception as e:
+                    print(f'Error: {e}')
+                    print(gdf)
+                    exit(1)
+
+            return self._streets_gdf
+
+        def create_utm_geojson(self, filename):
+            ''' Create geojson file with UTM coordinates '''
+
+            gdf = pandas.concat([
+                self.polygon_gdf,
+                self._elevation_gdf
+            ], ignore_index=True)
+
+            # Loop over all elevation polygons and clip the streets they contain
+            # Add column with elevation to clipped streets
+            for i, row in self._elevation_gdf.iterrows():
+                if not row['geometry'].is_empty:
+                    streets_gdf = self.streets_gdf.copy()
+                    streets_gdf['geometry'] = streets_gdf.intersection(row['geometry'])
+                    streets_gdf = streets_gdf[~streets_gdf.is_empty]
+                    streets_gdf['elevation'] = row['elevation']
+                    gdf = pandas.concat([gdf, streets_gdf], ignore_index=True)
+
+            gdf = gdf.to_crs('EPSG:32632')
+            gdf.to_file(filename)
+
+    # Create hexagon around point.
+    point_utm = TO_UTM.transform(point[1], point[0])
+    hexagon_center = Hexagon(shapely.geometry.Point(point_utm), HEXAGON_SIZE)
+
+    # Create hexagons around center
+    hexagons = [hexagon_center]
+    for i in range(1, 1):
+        hexagons.extend(hexagon_center.get_neighbours(i))
+
+    # Create overall geojson
+    gdfs = []
+    elevation_bounds = [float('inf'), float('-inf')]
+    for hexagon in hexagons:
+        elevation_gdf, elevation_bounds = hexagon.get_elevation_gdf(5, elevation_bounds)
+        gdfs.append(elevation_gdf)
+        gdfs.append(hexagon.streets_gdf)
+        gdfs.append(hexagon.polygon_gdf)
+    gdf = pandas.concat(gdfs, ignore_index=True)
+    print(gdf)
+    print(f'Elevation min: {elevation_bounds[0]}, max: {elevation_bounds[1]}')
+    gdf.to_file('out.geojson')
+
+    # Create SVG per hexagon
+    for i, hexagon in enumerate(hexagons):
+        hexagon.create_utm_geojson(f'hexagon_{i}.geojson')
 
 if __name__ == '__main__':
-    center_query = 'Groß Escherde'
-    square_size_km = 3
-    square_size = square_size_km / 1.852 / 60
-
-    # Get geo coordinates
-    print(f'Get location of "{center_query}" ...', end=" ")
-    center_location = ox.geocoder.geocode(center_query) # lat (y), long (x)
-    print(center_location)
-
-    square_bounds = create_bbox(center_location, square_size)
-    square_bounds = ox.utils_geo.bbox_from_point(center_location, dist=TILE_SIZE_METERS)
-    print(square_bounds)
-
-    # Create geojson
-    geojson = GeoJSON()
-    geojson.add_bbox(square_bounds)
-    fetch_streets(square_bounds, geojson)
-    fetch_landuse(square_bounds, geojson, 'residential')
-    fetch_elevation(square_bounds, geojson)
-    geojson.save('tile.geojson')
-
-
+    main()
